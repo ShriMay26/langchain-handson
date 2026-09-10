@@ -1,14 +1,47 @@
 import os
+import re
 import time
+import json
 from datetime import datetime
 from typing import Any
 
 import streamlit as st
 from langchain.agents import create_agent
+from langchain_core.messages import HumanMessage, SystemMessage
 from langchain.tools import tool
 from langchain_core.tracers.langchain import LangChainTracer
 from langchain_openai import ChatOpenAI
 from langsmith import Client
+
+
+AI_JUDGE_QUESTIONS = {
+    "Security": [
+        "Does the code expose secrets, tokens, credentials, or unsafe sensitive configuration?",
+        "Does the code expose or process PII without clear protection or minimization?",
+        "Are there dangerous execution paths such as eval, exec, shell calls, or unsafe deserialization?",
+        "Is external or user input validated and handled safely?",
+    ],
+    "Quality": [
+        "Is the code clear, readable, and appropriately structured for its size?",
+        "Are responsibilities separated well enough to keep the code maintainable?",
+        "Are naming, comments, and documentation sufficient for another developer to work on it safely?",
+        "Does the code avoid obvious duplication or unnecessary complexity?",
+    ],
+    "Reliability": [
+        "Does the code appear to handle edge cases, nulls, empty inputs, and failures correctly?",
+        "Is error handling appropriate for the behavior shown?",
+        "Would the suggested fixes likely reduce regressions without introducing obvious new risks?",
+    ],
+    "Testing": [
+        "Does the review identify the most important tests that should exist for this code?",
+        "Are the suggested fixes testable and easy to verify?",
+    ],
+    "Grounding": [
+        "Are the review comments grounded in the provided code rather than generic advice?",
+        "Are the suggested fixes specific to the provided code rather than speculative?",
+        "Is there evidence of hallucinated assumptions not supported by the code or findings?",
+    ],
+}
 
 
 @tool
@@ -126,6 +159,380 @@ def submit_langsmith_feedback(client: Client, run_id: str, score: int, key: str,
     )
 
 
+def clamp_score(score: int) -> int:
+    return max(1, min(5, score))
+
+
+def evaluate_quality(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    if "todo" in lower_code:
+        score -= 1
+        reasons.append("TODO markers suggest unfinished behavior.")
+    if "append(" in snippet and "for " in snippet:
+        reasons.append("Loop-based collection building may deserve simplification review.")
+    if len(snippet.splitlines()) > 40:
+        score -= 1
+        reasons.append("Long snippet size increases review risk.")
+    return clamp_score(score), reasons or ["No major quality concerns detected from heuristics."]
+
+
+def evaluate_security(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    risky_terms = ["api_key", "password", "secret", "token", "eval(", "exec("]
+    matches = [term for term in risky_terms if term in lower_code]
+    if matches:
+        score -= min(3, len(matches))
+        reasons.append(f"Sensitive or risky constructs found: {', '.join(matches)}.")
+    if "subprocess" in lower_code or "os.system" in lower_code:
+        score -= 1
+        reasons.append("Process execution paths need input sanitization review.")
+    return clamp_score(score), reasons or ["No major security concerns detected from heuristics."]
+
+
+def evaluate_maintainability(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    if '"""' not in snippet and "'''" not in snippet:
+        score -= 1
+        reasons.append("Missing docstring or module documentation.")
+    if len(snippet.splitlines()) > 40:
+        score -= 1
+        reasons.append("Large code blocks are harder to maintain.")
+    if snippet.count("if ") + snippet.count("for ") + snippet.count("while ") > 8:
+        score -= 1
+        reasons.append("Control-flow density is relatively high.")
+    return clamp_score(score), reasons or ["No major maintainability concerns detected."]
+
+
+def evaluate_reliability(snippet: str, review_text: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    lower_review = review_text.lower()
+    if "try:" not in snippet and "except" not in snippet:
+        score -= 1
+        reasons.append("No explicit error handling detected.")
+    if "empty input" in lower_code or "todo" in lower_code:
+        score -= 1
+        reasons.append("Edge-case handling appears incomplete.")
+    if "test" not in lower_review:
+        reasons.append("Review output does not yet reference test coverage.")
+    return clamp_score(score), reasons or ["No major reliability concerns detected."]
+
+
+def evaluate_documentation(snippet: str, review_text: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_review = review_text.lower()
+    if '"""' not in snippet and "'''" not in snippet:
+        score -= 2
+        reasons.append("No docstring detected.")
+    if "comment" not in lower_review and "document" not in lower_review:
+        reasons.append("Review did not identify any documentation expectations.")
+    return clamp_score(score), reasons or ["No major documentation concerns detected."]
+
+
+def evaluate_performance(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    if len(snippet.splitlines()) > 60:
+        score -= 1
+        reasons.append("Long routines often hide avoidable work.")
+    if ".append(" in snippet and "for " in snippet:
+        reasons.append("Potential vector for list-comprehension or batching improvement.")
+    if lower_code.count("for ") > 2:
+        score -= 1
+        reasons.append("Multiple loops may need complexity review.")
+    return clamp_score(score), reasons or ["No major performance concerns detected."]
+
+
+def evaluate_readability(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lines = [line for line in snippet.splitlines() if line.strip()]
+    if any(len(line) > 100 for line in lines):
+        score -= 1
+        reasons.append("Some lines are longer than 100 characters.")
+    if len(lines) > 25:
+        score -= 1
+        reasons.append("Long snippets are harder to scan quickly.")
+    if not any(line.strip().startswith("#") for line in lines) and '"""' not in snippet and "'''" not in snippet:
+        score -= 1
+        reasons.append("No inline comments or docstrings detected.")
+    return clamp_score(score), reasons or ["Readability looks acceptable from heuristics."]
+
+
+def evaluate_testability(snippet: str, review_text: str, fix_text: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_review = review_text.lower()
+    lower_fix = fix_text.lower()
+    if "test" not in lower_review:
+        score -= 1
+        reasons.append("Review comments did not mention tests.")
+    if "test" not in lower_fix:
+        score -= 1
+        reasons.append("Fix suggestions did not include test ideas.")
+    if snippet.count("def ") > 3 or snippet.count("class ") > 1:
+        reasons.append("Broader code surface may need multiple test cases.")
+    return clamp_score(score), reasons or ["Testability signals look acceptable."]
+
+
+def evaluate_secret_exposure(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    markers = ["api_key", "secret", "token", "password", "private_key"]
+    matches = [marker for marker in markers if marker in lower_code]
+    if matches:
+        score -= min(4, len(matches))
+        reasons.append(f"Potential secret-bearing identifiers found: {', '.join(matches)}.")
+    if re.search(r"sk-[A-Za-z0-9_-]{20,}", snippet):
+        score = min(score, 1)
+        reasons.append("String looks like a live API key.")
+    return clamp_score(score), reasons or ["No obvious secret exposure detected."]
+
+
+def evaluate_pii_exposure(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    pii_hits = []
+    if re.search(r"\b[^\s@]+@[^\s@]+\.[A-Za-z]{2,}\b", snippet):
+        pii_hits.append("email")
+    if re.search(r"\b\d{3}-\d{2}-\d{4}\b", snippet):
+        pii_hits.append("ssn-like")
+    if re.search(r"\b\+?\d[\d\s().-]{8,}\d\b", snippet):
+        pii_hits.append("phone-like")
+    if re.search(r"\b\d{13,19}\b", snippet):
+        pii_hits.append("card/account-like")
+    if pii_hits:
+        score -= min(4, len(set(pii_hits)))
+        reasons.append(f"Potential PII patterns detected: {', '.join(sorted(set(pii_hits)))}.")
+    return clamp_score(score), reasons or ["No obvious PII patterns detected."]
+
+
+def evaluate_input_safety(snippet: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_code = snippet.lower()
+    if "input(" in lower_code or "request." in lower_code or "argv" in lower_code:
+        reasons.append("Code appears to consume user input; validation should be checked.")
+    if any(term in lower_code for term in ["eval(", "exec(", "pickle.loads", "yaml.load("]):
+        score -= 2
+        reasons.append("Unsafe deserialization or dynamic execution pattern detected.")
+    if any(term in lower_code for term in ["subprocess", "os.system", "shell=true"]):
+        score -= 1
+        reasons.append("Command execution path may need sanitization.")
+    return clamp_score(score), reasons or ["No obvious input handling risks detected."]
+
+
+def evaluate_hallucination_risk(snippet: str, review_text: str, fix_text: str) -> tuple[int, list[str]]:
+    score = 5
+    reasons = []
+    lower_context = f"{snippet}\n{review_text}".lower()
+    lower_fix = fix_text.lower()
+    external_terms = [
+        "database",
+        "sql",
+        "authentication",
+        "jwt",
+        "docker",
+        "kubernetes",
+        "redis",
+        "aws",
+        "s3",
+        "microservice",
+    ]
+    unsupported = [term for term in external_terms if term in lower_fix and term not in lower_context]
+    if unsupported:
+        score -= min(3, len(unsupported))
+        reasons.append(f"Fixes mention concepts not grounded in the input: {', '.join(unsupported[:5])}.")
+    if "improved version" not in lower_fix and "fix" not in lower_fix:
+        score -= 1
+        reasons.append("Fix response may be too generic to verify against the code.")
+    return clamp_score(score), reasons or ["Generated suggestions look reasonably grounded in the input."]
+
+
+def average_scores(scores: dict[str, int]) -> float:
+    return round(sum(scores.values()) / len(scores), 2)
+
+
+def extract_json_payload(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+    if cleaned.startswith("```"):
+        newline_index = cleaned.find("\n")
+        if newline_index != -1:
+            cleaned = cleaned[newline_index + 1 :]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3].rstrip()
+
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end == -1 or end <= start:
+        raise ValueError("AI Judge did not return a valid JSON object.")
+    return json.loads(cleaned[start : end + 1])
+
+
+def build_ai_judge_prompt(language: str, snippet: str, review_text: str, fix_text: str) -> str:
+    questions_block = []
+    for category, questions in AI_JUDGE_QUESTIONS.items():
+        questions_block.append(category + ":")
+        questions_block.extend(f"- {question}" for question in questions)
+
+    joined_questions = "\n".join(questions_block)
+    return (
+        f"Evaluate the following {language} code, the review comments, and the suggested fixes.\n\n"
+        "Use only the provided inputs. Do not invent missing architecture, services, or behavior.\n"
+        "For each question, return a score from 1 to 5, a verdict of pass/partial/fail, and a brief evidence-based reason.\n"
+        "Then compute average scores per category and an overall score.\n"
+        "Return JSON only using this schema:\n"
+        "{\n"
+        '  "overall_score": number,\n'
+        '  "summary": "string",\n'
+        '  "top_risks": ["string"],\n'
+        '  "categories": [\n'
+        "    {\n"
+        '      "name": "string",\n'
+        '      "average_score": number,\n'
+        '      "questions": [\n'
+        "        {\n"
+        '          "question": "string",\n'
+        '          "score": number,\n'
+        '          "verdict": "pass|partial|fail",\n'
+        '          "reason": "string"\n'
+        "        }\n"
+        "      ]\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        f"Questions:\n{joined_questions}\n\n"
+        f"Code:\n{snippet}\n\n"
+        f"Review comments:\n{review_text}\n\n"
+        f"Suggested fixes:\n{fix_text}"
+    )
+
+
+def run_ai_judge(
+    api_key: str,
+    model_name: str,
+    language: str,
+    snippet: str,
+    review_text: str,
+    fix_text: str,
+    tracing_config: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, int], str]:
+    judge_llm = ChatOpenAI(model=model_name, api_key=api_key)
+    response = judge_llm.invoke(
+        [
+            SystemMessage(
+                content=(
+                    "You are an AI Judge for code review quality, security, reliability, and grounding. "
+                    "Be strict, evidence-based, and return valid JSON only."
+                )
+            ),
+            HumanMessage(content=build_ai_judge_prompt(language, snippet, review_text, fix_text)),
+        ],
+        config=tracing_config,
+    )
+    usage_meta = getattr(response, "usage_metadata", None) or {}
+    usage = {
+        "input_tokens": usage_meta.get("input_tokens", 0),
+        "output_tokens": usage_meta.get("output_tokens", 0),
+        "total_tokens": usage_meta.get("total_tokens", 0),
+    }
+    raw_text = extract_text(response.content)
+    return extract_json_payload(raw_text), usage, raw_text
+
+
+def build_evaluation_metrics(snippet: str, review_text: str, fix_text: str) -> dict[str, Any]:
+    evaluators = {
+        "quality": lambda: evaluate_quality(snippet),
+        "security": lambda: evaluate_security(snippet),
+        "maintainability": lambda: evaluate_maintainability(snippet),
+        "reliability": lambda: evaluate_reliability(snippet, review_text),
+        "documentation": lambda: evaluate_documentation(snippet, review_text),
+        "performance": lambda: evaluate_performance(snippet),
+    }
+    scores = {}
+    reasons = {}
+    for dimension, evaluator in evaluators.items():
+        score, dimension_reasons = evaluator()
+        scores[dimension] = score
+        reasons[dimension] = dimension_reasons
+
+    if "improved code" in fix_text.lower() or "prioritized" in fix_text.lower():
+        scores["quality"] = clamp_score(scores["quality"] + 1)
+
+    quality_subscores = {
+        "quality": scores["quality"],
+        "readability": evaluate_readability(snippet)[0],
+        "maintainability": scores["maintainability"],
+        "documentation": scores["documentation"],
+        "testability": evaluate_testability(snippet, review_text, fix_text)[0],
+        "performance": scores["performance"],
+    }
+    security_subscores = {
+        "security": scores["security"],
+        "pii_exposure": evaluate_pii_exposure(snippet)[0],
+        "secret_exposure": evaluate_secret_exposure(snippet)[0],
+        "input_safety": evaluate_input_safety(snippet)[0],
+    }
+    ai_review_subscores = {
+        "reliability": scores["reliability"],
+        "hallucination_risk": evaluate_hallucination_risk(snippet, review_text, fix_text)[0],
+        "grounding": evaluate_hallucination_risk(snippet, review_text, fix_text)[0],
+        "fix_actionability": evaluate_testability(snippet, review_text, fix_text)[0],
+    }
+
+    grouped_reasons = {
+        "quality": {
+            "quality": reasons["quality"],
+            "readability": evaluate_readability(snippet)[1],
+            "maintainability": reasons["maintainability"],
+            "documentation": reasons["documentation"],
+            "testability": evaluate_testability(snippet, review_text, fix_text)[1],
+            "performance": reasons["performance"],
+        },
+        "security": {
+            "security": reasons["security"],
+            "pii_exposure": evaluate_pii_exposure(snippet)[1],
+            "secret_exposure": evaluate_secret_exposure(snippet)[1],
+            "input_safety": evaluate_input_safety(snippet)[1],
+        },
+        "ai_review": {
+            "reliability": reasons["reliability"],
+            "hallucination_risk": evaluate_hallucination_risk(snippet, review_text, fix_text)[1],
+            "grounding": evaluate_hallucination_risk(snippet, review_text, fix_text)[1],
+            "fix_actionability": evaluate_testability(snippet, review_text, fix_text)[1],
+        },
+    }
+
+    category_scores = {
+        "quality": average_scores(quality_subscores),
+        "security": average_scores(security_subscores),
+        "ai_review": average_scores(ai_review_subscores),
+    }
+
+    overall = round(sum(scores.values()) / len(scores), 2)
+    return {
+        "overall": overall,
+        "scores": scores,
+        "reasons": reasons,
+        "categories": {
+            "quality": quality_subscores,
+            "security": security_subscores,
+            "ai_review": ai_review_subscores,
+        },
+        "category_scores": category_scores,
+        "category_reasons": grouped_reasons,
+    }
+
+
 def init_state():
     defaults = {
         "snippet": (
@@ -139,6 +546,9 @@ def init_state():
         "usage_history": [],
         "activity_logs": [],
         "evaluation_logs": [],
+        "evaluation_history": [],
+        "judge_result": None,
+        "judge_history": [],
         "review_output": "",
         "fix_output": "",
         "last_review_run_id": None,
@@ -230,6 +640,8 @@ with st.sidebar:
             "usage_history",
             "activity_logs",
             "evaluation_logs",
+            "evaluation_history",
+            "judge_history",
             "review_output",
             "fix_output",
             "last_review_run_id",
@@ -238,6 +650,7 @@ with st.sidebar:
             "last_fix_run_url",
             "langsmith_status",
             "latest_internals",
+            "judge_result",
         ]:
             st.session_state[key] = [] if key.endswith(("history", "logs")) else None
         st.session_state.review_output = ""
@@ -254,8 +667,8 @@ if not selected_model:
 if enable_langsmith and not active_langsmith_key:
     st.warning("LangSmith tracing is enabled but API key is missing.")
 
-tab_review, tab_monitoring, tab_tracing, tab_flow = st.tabs(
-    ["Review", "Monitoring", "Tracing", "Agentic Flow"]
+tab_review, tab_monitoring, tab_evaluation, tab_tracing, tab_flow = st.tabs(
+    ["Review", "Monitoring", "Evaluation", "Tracing", "Agentic Flow"]
 )
 
 with tab_review:
@@ -444,6 +857,23 @@ with tab_review:
                     "fix_messages": summarize_messages(fix_result),
                 }
 
+                evaluation_metrics = build_evaluation_metrics(snippet, review_text, fix_text)
+                st.session_state.latest_internals["evaluation_metrics"] = evaluation_metrics
+                st.session_state.judge_result = None
+                st.session_state.evaluation_history.append(
+                    {
+                        "run": run_id,
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "overall": evaluation_metrics["overall"],
+                        "quality_group": evaluation_metrics["category_scores"]["quality"],
+                        "security_group": evaluation_metrics["category_scores"]["security"],
+                        "ai_review_group": evaluation_metrics["category_scores"]["ai_review"],
+                        "pii_exposure": evaluation_metrics["categories"]["security"]["pii_exposure"],
+                        "hallucination_risk": evaluation_metrics["categories"]["ai_review"]["hallucination_risk"],
+                        **evaluation_metrics["scores"],
+                    }
+                )
+
                 add_activity_log(
                     {
                         "run": run_id,
@@ -503,6 +933,251 @@ with tab_monitoring:
         st.dataframe(st.session_state.activity_logs, width="stretch")
     else:
         st.info("No activity logs yet.")
+
+with tab_evaluation:
+    st.subheader("AI Judge Evaluation")
+    st.caption("Question-based evaluation across security, quality, reliability, testing, and grounding.")
+
+    question_tabs = st.tabs(list(AI_JUDGE_QUESTIONS.keys()))
+    for index, category in enumerate(AI_JUDGE_QUESTIONS):
+        with question_tabs[index]:
+            for question_number, question in enumerate(AI_JUDGE_QUESTIONS[category], start=1):
+                st.write(f"{question_number}. {question}")
+
+    if st.button("Run AI Judge", width="stretch"):
+        if not st.session_state.snippet.strip():
+            st.error("No code snippet available for evaluation.")
+        elif not st.session_state.review_output or not st.session_state.fix_output:
+            st.error("Run the multi-agent review first so the judge can evaluate both review and fixes.")
+        elif not active_openai_key:
+            st.error("OpenAI API key is missing.")
+        else:
+            try:
+                judge_trace_config = {}
+                judge_run_id = None
+                judge_run_url = None
+                if enable_langsmith and active_langsmith_key:
+                    _, judge_tracer, judge_trace_config = build_langsmith_runtime(
+                        enabled=True,
+                        api_key=active_langsmith_key,
+                        project_name=langsmith_project,
+                        endpoint=langsmith_endpoint,
+                        metadata={
+                            "app": "developer_agent_streamlit",
+                            "agent_role": "judge",
+                            "language": language,
+                            "model": selected_model,
+                        },
+                    )
+                else:
+                    judge_tracer = None
+
+                with st.spinner("Running AI Judge..."):
+                    judge_result, judge_usage, judge_raw = run_ai_judge(
+                        api_key=active_openai_key,
+                        model_name=selected_model,
+                        language=language,
+                        snippet=st.session_state.snippet,
+                        review_text=st.session_state.review_output,
+                        fix_text=st.session_state.fix_output,
+                        tracing_config=judge_trace_config,
+                    )
+                    if judge_tracer:
+                        judge_run_id, judge_run_url = get_run_id_and_url(judge_tracer)
+
+                st.session_state.judge_result = judge_result
+                st.session_state.latest_internals = st.session_state.latest_internals or {}
+                st.session_state.latest_internals["judge_raw"] = judge_raw
+                st.session_state.latest_internals["judge_usage"] = judge_usage
+                st.session_state.latest_internals["judge_trace"] = {
+                    "run_id": judge_run_id,
+                    "url": judge_run_url,
+                }
+
+                category_scores = {
+                    category["name"]: category["average_score"]
+                    for category in judge_result.get("categories", [])
+                }
+                st.session_state.judge_history.append(
+                    {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "overall": judge_result.get("overall_score", 0),
+                        **category_scores,
+                    }
+                )
+                add_activity_log(
+                    {
+                        "run": len(st.session_state.usage_history),
+                        "model": selected_model,
+                        "language": language,
+                        "source": "ai_judge",
+                        "status": "success",
+                        "tokens": judge_usage["total_tokens"],
+                    }
+                )
+                st.success("AI Judge evaluation completed.")
+            except Exception as exc:
+                st.error(f"AI Judge failed: {exc}")
+
+    latest = st.session_state.latest_internals
+    judge_result = st.session_state.judge_result
+    if judge_result:
+        overview_cols = st.columns(3)
+        overview_cols[0].metric("Overall Score", judge_result.get("overall_score", 0))
+        overview_cols[1].metric(
+            "Top Risk Count", len(judge_result.get("top_risks", []))
+        )
+        overview_cols[2].metric(
+            "Category Count", len(judge_result.get("categories", []))
+        )
+
+        category_scores = {
+            category["name"]: category["average_score"]
+            for category in judge_result.get("categories", [])
+        }
+        st.subheader("Category Scores")
+        st.bar_chart(category_scores, width="stretch")
+
+        st.subheader("Judge Summary")
+        st.write(judge_result.get("summary", "No summary returned."))
+
+        if judge_result.get("top_risks"):
+            st.subheader("Top Risks")
+            for risk in judge_result["top_risks"]:
+                st.write(f"- {risk}")
+
+        st.subheader("Question-Level Results")
+        result_tabs = st.tabs([category["name"] for category in judge_result.get("categories", [])])
+        for index, category in enumerate(judge_result.get("categories", [])):
+            with result_tabs[index]:
+                st.metric("Category Average", category.get("average_score", 0))
+                st.dataframe(category.get("questions", []), width="stretch")
+                for question in category.get("questions", []):
+                    st.progress(
+                        float(question.get("score", 0)) / 5,
+                        text=(
+                            f"{question.get('verdict', 'partial').title()} - "
+                            f"{question.get('question', '')}"
+                        ),
+                    )
+
+    elif latest and latest.get("evaluation_metrics"):
+        metrics = latest["evaluation_metrics"]
+        score_cols = st.columns(4)
+        score_cols[0].metric("Overall", metrics["overall"])
+        score_cols[1].metric("Quality", metrics["scores"]["quality"])
+        score_cols[2].metric("Security", metrics["scores"]["security"])
+        score_cols[3].metric("Reliability", metrics["scores"]["reliability"])
+
+        more_cols = st.columns(3)
+        more_cols[0].metric("Maintainability", metrics["scores"]["maintainability"])
+        more_cols[1].metric("Documentation", metrics["scores"]["documentation"])
+        more_cols[2].metric("Performance", metrics["scores"]["performance"])
+
+        st.subheader("Category Overview")
+        category_cols = st.columns(3)
+        category_cols[0].metric("Quality Group", metrics["category_scores"]["quality"])
+        category_cols[1].metric("Security Group", metrics["category_scores"]["security"])
+        category_cols[2].metric("AI Review Group", metrics["category_scores"]["ai_review"])
+
+        st.bar_chart(metrics["category_scores"], width="stretch")
+
+        quality_col, security_col, ai_col = st.columns(3)
+        with quality_col:
+            st.markdown("**Quality Metrics**")
+            st.bar_chart(metrics["categories"]["quality"], width="stretch")
+            for metric_name, score in metrics["categories"]["quality"].items():
+                st.progress(score / 5, text=f"{metric_name.replace('_', ' ').title()}: {score}/5")
+
+        with security_col:
+            st.markdown("**Security Metrics**")
+            st.bar_chart(metrics["categories"]["security"], width="stretch")
+            for metric_name, score in metrics["categories"]["security"].items():
+                st.progress(score / 5, text=f"{metric_name.replace('_', ' ').title()}: {score}/5")
+
+        with ai_col:
+            st.markdown("**AI Review Metrics**")
+            st.bar_chart(metrics["categories"]["ai_review"], width="stretch")
+            for metric_name, score in metrics["categories"]["ai_review"].items():
+                st.progress(score / 5, text=f"{metric_name.replace('_', ' ').title()}: {score}/5")
+
+        st.subheader("Metric Rationale")
+        rationale_rows = []
+        for dimension, score in metrics["scores"].items():
+            rationale_rows.append(
+                {
+                    "dimension": dimension,
+                    "score": score,
+                    "notes": " ".join(metrics["reasons"][dimension]),
+                }
+            )
+        st.dataframe(rationale_rows, width="stretch")
+
+        st.subheader("Detailed Evaluation Notes")
+        detail_tab1, detail_tab2, detail_tab3 = st.tabs(["Quality", "Security", "AI Review"])
+        with detail_tab1:
+            st.dataframe(
+                [
+                    {
+                        "metric": key,
+                        "score": value,
+                        "notes": " ".join(metrics["category_reasons"]["quality"][key]),
+                    }
+                    for key, value in metrics["categories"]["quality"].items()
+                ],
+                width="stretch",
+            )
+        with detail_tab2:
+            st.dataframe(
+                [
+                    {
+                        "metric": key,
+                        "score": value,
+                        "notes": " ".join(metrics["category_reasons"]["security"][key]),
+                    }
+                    for key, value in metrics["categories"]["security"].items()
+                ],
+                width="stretch",
+            )
+        with detail_tab3:
+            st.dataframe(
+                [
+                    {
+                        "metric": key,
+                        "score": value,
+                        "notes": " ".join(metrics["category_reasons"]["ai_review"][key]),
+                    }
+                    for key, value in metrics["categories"]["ai_review"].items()
+                ],
+                width="stretch",
+            )
+    else:
+        st.info("No automated evaluation yet. Run a review to generate metrics.")
+
+    st.subheader("Metrics Trend")
+    if st.session_state.judge_history:
+        st.line_chart(st.session_state.judge_history, width="stretch")
+        st.dataframe(st.session_state.judge_history, width="stretch")
+    elif st.session_state.evaluation_history:
+        st.line_chart(
+            {
+                "overall": [row["overall"] for row in st.session_state.evaluation_history],
+                "quality_group": [row["quality_group"] for row in st.session_state.evaluation_history],
+                "security_group": [row["security_group"] for row in st.session_state.evaluation_history],
+                "ai_review_group": [row["ai_review_group"] for row in st.session_state.evaluation_history],
+                "pii_exposure": [row["pii_exposure"] for row in st.session_state.evaluation_history],
+                "hallucination_risk": [row["hallucination_risk"] for row in st.session_state.evaluation_history],
+                "quality": [row["quality"] for row in st.session_state.evaluation_history],
+                "security": [row["security"] for row in st.session_state.evaluation_history],
+                "maintainability": [
+                    row["maintainability"] for row in st.session_state.evaluation_history
+                ],
+                "reliability": [row["reliability"] for row in st.session_state.evaluation_history],
+            }
+        )
+        st.dataframe(st.session_state.evaluation_history, width="stretch")
+    else:
+        st.info("No evaluation trend data yet.")
 
 with tab_tracing:
     st.subheader("LangSmith Tracing")
